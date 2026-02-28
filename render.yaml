@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: bbb-web2
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --worker-class gthread --threads 4
+    envVars:
+      - key: AVATAR_API_KEY
+        sync: false
+      - key: AVATAR_API_BASE_URL
+        value: https://api.liveavatar.com
+      - key: GMAIL_ADDRESS
+        value: agentic.avai@gmail.com
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: GITHUB_TOKEN_STAGE_2
+        sync: false
+      - key: GITHUB_REPO
+        value: Krish1959/bbb-web
+      - key: GITHUB_DATA_BRANCH
+        value: data
