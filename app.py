@@ -98,8 +98,12 @@ CSV_PATH            = "submissions.csv"
 LOG_PATH            = "stage2_log.csv"
 SUBJECT_PREFIX      = "[Web Scrapped] Context for Avatar Chat -"
 
-APP_VERSION         = "2.1"  # v2.1 = Fixed HeyGen API format
+APP_VERSION         = "2.2"  # v2.2 = Restored email mode + enhanced debug + Gemini ready
 APP_NAME            = "BBB Avatar Maker — Stage 2"
+
+# ── Gemini API (optional — for future agentic content processing) ──
+GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 
 # ═══════════════════════════════════════════════════════════
 # FLASK APP
@@ -173,15 +177,39 @@ def gh_put(path: str, text: str, sha: Optional[str], message: str) -> None:
 # CSV HELPERS
 # ═══════════════════════════════════════════════════════════
 def load_csv() -> List[Dict[str, str]]:
-    log.info("[CSV] Loading %s from GitHub repo=%s branch=%s", CSV_PATH, GITHUB_REPO, GITHUB_DATA_BRANCH)
+    log.info("[CSV] ── Loading submissions.csv ──────────────────────────")
+    log.info("[CSV] Source: GitHub repo=%s  branch=%s  path=%s", GITHUB_REPO, GITHUB_DATA_BRANCH, CSV_PATH)
     text = gh_get(CSV_PATH)
     if not text:
         log.warning("[CSV] Empty or missing — returning []")
         return []
     rows = list(csv.DictReader(io.StringIO(text)))
-    log.info("[CSV] Loaded %d rows. Columns: %s", len(rows), list(rows[0].keys()) if rows else "N/A")
+    log.info("[CSV] Loaded %d data rows (excluding header)", len(rows))
     if rows:
-        log.info("[CSV] Last row: %s", json.dumps(rows[-1]))
+        log.info("[CSV] Columns detected: %s", list(rows[0].keys()))
+        log.info("[CSV] ── All rows (Sl_No | Date | Company | Email | Web_URL) ──")
+        for r in rows:
+            log.info("[CSV]   #%-3s  %s  %-25s  %-30s  %s",
+                     r.get("Sl_No","?"),
+                     r.get("Date","?"),
+                     r.get("Company","?"),
+                     r.get("Email","?"),
+                     r.get("Web_URL","?"))
+        log.info("[CSV] ── Last row (will be used in TEST mode) ──")
+        last = rows[-1]
+        for k, v in last.items():
+            log.info("[CSV]   %-12s : %s", k, v)
+        # Cross-check: warn if SP entry exists as expected
+        sp_rows = [r for r in rows if "sp.edu.sg" in (r.get("Web_URL") or "").lower()
+                   or (r.get("Company") or "").strip().upper() == "SP"]
+        if sp_rows:
+            log.info("[CSV] ✔ SP entry found in CSV:")
+            for r in sp_rows:
+                log.info("[CSV]   Sl_No=%s  Date=%s  Company=%s  Email=%s  Web_URL=%s",
+                         r.get("Sl_No"), r.get("Date"), r.get("Company"),
+                         r.get("Email"), r.get("Web_URL"))
+        else:
+            log.warning("[CSV] ⚠ No SP entry found — expected row with Web_URL containing 'sp.edu.sg'")
     return rows
 
 def append_run_log(shortname: str, company: str, email: str,
@@ -299,7 +327,15 @@ def gmail_scan_matching(registered: Dict[str, Any]) -> List[Dict[str, Any]]:
       2. Have subject starting with SUBJECT_PREFIX
     Returns newest-first, one per sender.
     """
-    log.info("[Gmail] Starting inbox scan. Registered senders: %s", list(registered.keys()))
+    log.info("[Gmail] ══ Starting inbox scan ══════════════════════════")
+    log.info("[Gmail] Inbox account  : %s", GMAIL_ADDRESS)
+    log.info("[Gmail] Subject prefix : '%s'", SUBJECT_PREFIX)
+    log.info("[Gmail] Registered senders (%d):", len(registered))
+    for addr in registered:
+        r = registered[addr]
+        log.info("[Gmail]   %-35s → company=%s  web=%s",
+                 addr, r.get("Company","?"), r.get("Web_URL","?"))
+
     try:
         imap = gmail_connect()
     except Exception as e:
@@ -315,9 +351,11 @@ def gmail_scan_matching(registered: Dict[str, Any]) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+    log.info("[Gmail] ── Filtering %d messages ──", len(messages))
     matched: Dict[str, Dict[str, Any]] = {}
     skipped_not_registered = 0
     skipped_subject        = 0
+    skipped_duplicate      = 0
 
     for msg in messages:
         sender = msg["from_addr"]
@@ -327,59 +365,135 @@ def gmail_scan_matching(registered: Dict[str, Any]) -> List[Dict[str, Any]]:
             skipped_not_registered += 1
             continue
 
-        log.info("[Gmail] Registered sender found: %s | Subject: %s", sender, subj)
+        # Registered sender found — log details
+        log.info("[Gmail] ── Registered sender: %s ──────────────────", sender)
+        log.info("[Gmail]   Date    : %s", msg.get("date_str","?"))
+        log.info("[Gmail]   Subject : %s", subj)
+        log.info("[Gmail]   Body len: %d chars", len(msg.get("body_text","")))
 
+        # Subject check
         if not subj.startswith(SUBJECT_PREFIX):
-            log.warning("[Gmail] Subject MISMATCH for %s", sender)
+            log.warning("[Gmail] ✘ Subject MISMATCH — skipping this email")
             log.warning("[Gmail]   Expected prefix : '%s'", SUBJECT_PREFIX)
-            log.warning("[Gmail]   Got subject     : '%s'", subj)
+            log.warning("[Gmail]   Actual subject  : '%s'", subj)
+            log.warning("[Gmail]   Difference      : first mismatch at char %d",
+                        next((i for i,(a,b) in enumerate(zip(SUBJECT_PREFIX, subj)) if a!=b),
+                             min(len(SUBJECT_PREFIX), len(subj))))
             skipped_subject += 1
             continue
 
-        if sender not in matched:
-            matched[sender] = msg
-            log.info("[Gmail] ✔ MATCHED email from %s: %s", sender, subj)
+        # Already have a newer email from this sender?
+        if sender in matched:
+            log.info("[Gmail] ℹ Duplicate sender %s — keeping newest, skipping older", sender)
+            skipped_duplicate += 1
+            continue
 
-    log.info("[Gmail] Scan summary: total=%d  skipped_not_registered=%d  skipped_subject=%d  matched=%d",
-             len(messages), skipped_not_registered, skipped_subject, len(matched))
+        matched[sender] = msg
+        log.info("[Gmail] ✔ MATCHED: from=%s  subject=%s", sender, subj)
+        log.info("[Gmail]   Body preview (first 300 chars):")
+        preview = msg.get("body_text","")[:300].replace("\n", " | ")
+        log.info("[Gmail]   %s", preview)
+
+    log.info("[Gmail] ══ Scan complete ══════════════════════════════")
+    log.info("[Gmail]   Total messages     : %d", len(messages))
+    log.info("[Gmail]   Not registered     : %d", skipped_not_registered)
+    log.info("[Gmail]   Subject mismatch   : %d", skipped_subject)
+    log.info("[Gmail]   Duplicate (skipped): %d", skipped_duplicate)
+    log.info("[Gmail]   ✔ Matched & queued : %d", len(matched))
+
+    if not matched:
+        log.warning("[Gmail] ⚠ RESULT: No qualifying emails found.")
+        log.warning("[Gmail]   Checklist:")
+        log.warning("[Gmail]   1. Is sender email in submissions.csv? (registered senders listed above)")
+        log.warning("[Gmail]   2. Does subject start with exactly: '%s'", SUBJECT_PREFIX)
+        log.warning("[Gmail]   3. Check Gmail inbox — is email in PRIMARY tab (not Promotions/Social)?")
+        log.warning("[Gmail]   4. Has the email been moved/archived/deleted?")
 
     return list(matched.values())
 
 # ═══════════════════════════════════════════════════════════
 # CONTENT EXTRACTION
 # ═══════════════════════════════════════════════════════════
-def extract_context_block(body: str, shortname: str) -> Optional[str]:
+def extract_context_block(body: str, shortname: str, company: str = "") -> Optional[str]:
     """
     Strip human reply text and quoted lines.
-    Find '# <ShortName>' marker and return everything from there.
+    Find '# <ShortName>' or '# <Company>' marker and return everything from there.
+    Enhanced debug version.
     """
-    log.info("[Extract] Looking for marker '# %s' in body (%d chars)", shortname, len(body))
+    log.info("[Extract] ══ Context extraction ══════════════════════════")
+    log.info("[Extract] Target shortname : '%s'", shortname)
+    log.info("[Extract] Target company   : '%s'", company)
+    log.info("[Extract] Raw body length  : %d chars", len(body))
+    log.info("[Extract] Raw body (first 400 chars):")
+    log.info("[Extract] %s", body[:400].replace("\n", " ↵ "))
 
-    # Strip quoted lines (lines starting with ">")
-    clean_lines = [l for l in body.splitlines() if not l.strip().startswith(">")]
+    # Step 1: Strip quoted lines (lines starting with ">")
+    all_lines   = body.splitlines()
+    clean_lines = [l for l in all_lines if not l.strip().startswith(">")]
+    removed_quoted = len(all_lines) - len(clean_lines)
     clean_body  = "\n".join(clean_lines)
+    log.info("[Extract] Step 1 — Stripped %d quoted lines (>) — body now %d chars",
+             removed_quoted, len(clean_body))
 
-    # Strip "On ... wrote:" tail (Gmail reply quoting)
-    clean_body = re.split(r"\nOn .+? wrote:", clean_body, flags=re.DOTALL)[0]
-    log.info("[Extract] Body after stripping quotes: %d chars", len(clean_body))
+    # Step 2: Strip "On ... wrote:" Gmail tail
+    parts = re.split(r"\nOn .+? wrote:", clean_body, flags=re.DOTALL)
+    if len(parts) > 1:
+        log.info("[Extract] Step 2 — Stripped Gmail 'On...wrote:' tail (%d chars removed)",
+                 len(clean_body) - len(parts[0]))
+        clean_body = parts[0]
+    else:
+        log.info("[Extract] Step 2 — No 'On...wrote:' tail found")
 
-    # Primary: find exact "# <shortname>" marker
+    log.info("[Extract] Body after cleaning: %d chars", len(clean_body))
+    log.info("[Extract] Cleaned body (first 500 chars):")
+    log.info("[Extract] %s", clean_body[:500].replace("\n", " ↵ "))
+
+    # Step 3: Primary search — "# <shortname>"
+    log.info("[Extract] Step 3 — Searching for primary marker: '# %s'", shortname)
     pattern = re.compile(r"(#\s*" + re.escape(shortname) + r"\b.*)", re.IGNORECASE | re.DOTALL)
     m = pattern.search(clean_body)
     if m:
         result = m.group(1).strip()
-        log.info("[Extract] ✔ Found primary marker. Extracted %d chars", len(result))
+        log.info("[Extract] ✔ PRIMARY marker found at char %d", m.start())
+        log.info("[Extract] Extracted %d chars", len(result))
+        log.info("[Extract] First 300 chars of extracted context:")
+        log.info("[Extract] %s", result[:300].replace("\n", " ↵ "))
         return result
 
-    # Fallback: any "# Word" heading
-    log.warning("[Extract] Primary marker '# %s' NOT found. Trying fallback (any # heading)...", shortname)
-    m2 = re.search(r"(#\s+\S+.*)", clean_body, re.DOTALL)
-    if m2:
-        result = m2.group(1).strip()
-        log.warning("[Extract] Fallback matched. Extracted %d chars. First 100: %s", len(result), result[:100])
+    log.warning("[Extract] ✘ Primary marker '# %s' NOT found", shortname)
+
+    # Step 3b: Try company name as marker if different from shortname
+    if company and company.lower() != shortname.lower():
+        log.info("[Extract] Step 3b — Trying company name marker: '# %s'", company)
+        pat2 = re.compile(r"(#\s*" + re.escape(company) + r"\b.*)", re.IGNORECASE | re.DOTALL)
+        m2 = pat2.search(clean_body)
+        if m2:
+            result = m2.group(1).strip()
+            log.info("[Extract] ✔ COMPANY NAME marker found at char %d", m2.start())
+            log.info("[Extract] Extracted %d chars", len(result))
+            return result
+        log.warning("[Extract] ✘ Company name marker '# %s' NOT found either", company)
+
+    # Step 4: Fallback — any "# Word" heading
+    log.warning("[Extract] Step 4 — Trying fallback: any '# <heading>' marker")
+    all_headings = re.findall(r"#\s+\S[^\n]*", clean_body)
+    log.warning("[Extract] All '#' headings found in body: %s", all_headings)
+
+    m3 = re.search(r"(#\s+\S+.*)", clean_body, re.DOTALL)
+    if m3:
+        result = m3.group(1).strip()
+        log.warning("[Extract] ⚠ Using FALLBACK heading at char %d", m3.start())
+        log.warning("[Extract] Fallback extracted %d chars", len(result))
+        log.warning("[Extract] First 200 chars: %s", result[:200].replace("\n", " ↵ "))
         return result
 
-    log.error("[Extract] No marker found at all. Body first 300 chars: %s", clean_body[:300])
+    log.error("[Extract] ✘ COMPLETE FAILURE — no marker found at all")
+    log.error("[Extract] Full cleaned body for manual inspection:")
+    # Log in chunks to avoid truncation
+    chunk_size = 400
+    for i in range(0, min(len(clean_body), 2000), chunk_size):
+        log.error("[Extract] [%d-%d] %s", i, i+chunk_size,
+                  clean_body[i:i+chunk_size].replace("\n", " ↵ "))
     return None
 
 def extract_opening_intro(context_text: str) -> str:
@@ -459,40 +573,45 @@ class AvatarAPIClient:
         """
         Find unique name, build payload, upload.
         Returns (context_name, status, response_dict).
-        
-        FIX v2:
-          - Changed opening_text → opening_intro (correct HeyGen field)
-          - Improved payload structure
+
+        API requires BOTH opening_intro AND opening_text fields.
         """
         context_name = self.find_unique_name(shortname)
-        
-        # FIX v2: Use correct field name "opening_intro" instead of "opening_text"
+
+        # API requires both opening_intro AND opening_text (same value)
         payload = {
-            "name":               context_name,
-            "opening_intro":      opening_intro,  # ✅ FIXED from opening_text
-            "description":        prompt[:500],    # Use first 500 chars as description
-            "prompt":             prompt,          # Full prompt
+            "name":          context_name,
+            "opening_intro": opening_intro,   # ✅ Correct field (v2.1 fix)
+            "opening_text":  opening_intro,   # ✅ Also required by API (v2.2 fix)
+            "description":   prompt[:500],
+            "prompt":        prompt,
         }
-        log.info("[AvatarAPI] Uploading context: name=%s  opening_intro_len=%d  prompt_len=%d",
-                 context_name, len(opening_intro), len(prompt))
-        resp   = self.create_context(payload)
-        
-        # Extract context ID from response (handle both nested and flat structures)
+        log.info("[AvatarAPI] ── Payload being sent ──────────────────────")
+        log.info("[AvatarAPI]   name          : %s", context_name)
+        log.info("[AvatarAPI]   opening_intro : %s", opening_intro[:120])
+        log.info("[AvatarAPI]   opening_text  : %s (copy of opening_intro)", opening_intro[:120])
+        log.info("[AvatarAPI]   description   : %s...", prompt[:100])
+        log.info("[AvatarAPI]   prompt length : %d chars", len(prompt))
+        log.info("[AvatarAPI]   full payload  : %s", json.dumps(payload)[:400])
+        log.info("[AvatarAPI] ─────────────────────────────────────────────")
+
+        resp = self.create_context(payload)
+
+        # Extract context ID from both nested and flat response structures
         context_id = None
         if isinstance(resp.get("data"), dict):
-            context_id = resp["data"].get("id")  # Nested: {data: {id: ...}}
+            context_id = resp["data"].get("id")
         if not context_id:
-            context_id = resp.get("id")  # Flat: {id: ...}
-        
-        # Determine status (look for success indicators)
-        status = "created"
+            context_id = resp.get("id")
+
+        # Determine status
         if resp.get("code") == 1000 or context_id:
             status = "created"
         elif resp.get("code") and resp.get("code") >= 400:
             status = "error"
-        elif not context_id and not resp.get("code"):
+        else:
             status = "unknown"
-        
+
         log.info("[AvatarAPI] Upload result: status=%s  context_id=%s", status, context_id)
         return context_name, status, resp
 
@@ -582,24 +701,46 @@ def process_inbox(test_mode: bool = False) -> None:
 
     # ── NORMAL MODE ───────────────────────────────────────────
 
-    # Step 2: Build registered-email lookup (last row wins per email)
+    # Step 2: Build registered-email lookup (LAST row per email wins)
     registered: Dict[str, Dict[str, str]] = {}
     for row in rows:
         key = (row.get("Email") or "").strip().lower()
         if key:
             registered[key] = row
-    log.info("[Job] Registered email addresses (%d): %s", len(registered), list(registered.keys()))
+
+    log.info("[Job] ── Registered email lookup (%d unique addresses) ──", len(registered))
+    for addr, r in registered.items():
+        log.info("[Job]   %-35s → Sl_No=%-3s  Company=%-25s  Web=%s",
+                 addr, r.get("Sl_No","?"), r.get("Company","?"), r.get("Web_URL","?"))
+
+    # Cross-check: verify SP entry from CSV row 12 is registered
+    sp_entry = next((r for r in rows if (r.get("Company") or "").strip().upper() == "SP"), None)
+    if sp_entry:
+        sp_email = (sp_entry.get("Email") or "").strip().lower()
+        log.info("[Job] ✔ SP entry found in CSV: Sl_No=%s  Email=%s  Web=%s  Date=%s",
+                 sp_entry.get("Sl_No"), sp_email, sp_entry.get("Web_URL"), sp_entry.get("Date"))
+        if sp_email in registered:
+            log.info("[Job] ✔ SP sender email '%s' IS registered — will be checked in Gmail", sp_email)
+        else:
+            log.warning("[Job] ⚠ SP sender email '%s' NOT found in registered lookup!", sp_email)
+    else:
+        log.warning("[Job] ⚠ No SP entry in CSV — check submissions.csv has row with Company='SP'")
 
     # Step 3: Scan Gmail
+    log.info("[Job] ── Step 3: Scanning Gmail inbox ──────────────────")
     matching_emails = gmail_scan_matching(registered)
     if not matching_emails:
-        log.warning("[Job] No qualifying emails found in inbox. Nothing to upload.")
-        log.info("[Job] ══ NORMAL MODE COMPLETE (no action) ══")
+        log.warning("[Job] ⚠ No qualifying emails found in inbox.")
+        log.warning("[Job]   Remember: subject must start EXACTLY with:")
+        log.warning("[Job]   '%s'", SUBJECT_PREFIX)
+        log.warning("[Job]   The SP email subject 'Post SP to GitHub & Create a Webpage'")
+        log.warning("[Job]   does NOT match this prefix — it must be resent with correct subject.")
+        log.info("[Job] ══ NORMAL MODE COMPLETE (no action taken) ══")
         return
 
-    log.info("[Job] %d qualifying email(s) to process", len(matching_emails))
+    log.info("[Job] ── Step 4: Processing %d matching email(s) ──────", len(matching_emails))
 
-    # Step 4: Process each email
+    # Step 4: Process each matched email
     for msg in matching_emails:
         sender    = msg["from_addr"]
         row       = registered[sender]
@@ -607,13 +748,18 @@ def process_inbox(test_mode: bool = False) -> None:
         company   = (row.get("Company") or "").strip()
         shortname = shortname_from_url(web_url) if web_url else company.lower()
 
-        log.info("[Job] ── Processing email from %s (company=%s  shortname=%s)", sender, company, shortname)
+        log.info("[Job] ── Processing: sender=%s  company=%s  shortname=%s", sender, company, shortname)
+        log.info("[Job]   Email date    : %s", msg.get("date_str","?"))
+        log.info("[Job]   Email subject : %s", msg.get("subject","?"))
+        log.info("[Job]   Body length   : %d chars", len(msg.get("body_text","")))
 
-        context_text = extract_context_block(msg["body_text"], shortname)
+        # Pass both shortname AND company name for better marker detection
+        context_text = extract_context_block(msg["body_text"], shortname, company)
         if not context_text:
             log.error("[Job] ✘ Could not extract context block for %s — skipping", company)
             continue
 
+        log.info("[Job] ✔ Context extracted (%d chars) — uploading to Avatar API...", len(context_text))
         _upload_row(client, row, context_text)
 
     log.info("[Job] ══ NORMAL MODE COMPLETE ══")
@@ -837,6 +983,7 @@ def debug_page():
         ("GITHUB_TOKEN_STAGE_2", "SET" if GITHUB_TOKEN        else "MISSING"),
         ("GITHUB_REPO",          "SET" if GITHUB_REPO         else "MISSING"),
         ("GITHUB_DATA_BRANCH",   "SET" if GITHUB_DATA_BRANCH  else "MISSING"),
+        ("GEMINI_API_KEY",       "SET" if GEMINI_API_KEY      else "not set (optional)"),
     ]
     return render_template_string(
         _DEBUG_HTML,
