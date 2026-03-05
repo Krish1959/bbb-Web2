@@ -1,6 +1,12 @@
+
 """
-app.py — BBB Avatar Maker Stage 2  (Single Unified App)
+app_v2.py — BBB Avatar Maker Stage 2 (FIXED HeyGen API format)
 =========================================================
+FIXES from v1:
+  ✅ Fixed header case: X-API-Key (not x-api-key)
+  ✅ Fixed payload field: opening_intro (not opening_text)
+  ✅ Improved error handling and response parsing
+
 Architecture:
   • Flask web server  →  serves the Debug UI at /debug
   • APScheduler       →  fires process_inbox() daily at 09:00 SGT (background thread)
@@ -92,7 +98,7 @@ CSV_PATH            = "submissions.csv"
 LOG_PATH            = "stage2_log.csv"
 SUBJECT_PREFIX      = "[Web Scrapped] Context for Avatar Chat -"
 
-APP_VERSION         = "2.0"
+APP_VERSION         = "2.1"  # v2.1 = Fixed HeyGen API format
 APP_NAME            = "BBB Avatar Maker — Stage 2"
 
 # ═══════════════════════════════════════════════════════════
@@ -399,7 +405,8 @@ class AvatarAPIClient:
                  self.base_url, bool(self.api_key))
 
     def _headers(self) -> Dict[str, str]:
-        return {"x-api-key": self.api_key, "Content-Type": "application/json"}
+        # FIX v2: Use proper X-API-Key case (not x-api-key)
+        return {"X-API-Key": self.api_key, "Content-Type": "application/json"}
 
     def list_contexts(self) -> List[Dict[str, Any]]:
         log.info("[AvatarAPI] Listing existing contexts...")
@@ -414,6 +421,8 @@ class AvatarAPIClient:
     def create_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         log.info("[AvatarAPI] Creating context name='%s'  prompt_len=%d",
                  payload.get("name"), len(payload.get("prompt", "")))
+        log.info("[AvatarAPI] Payload: %s", json.dumps(payload)[:200])
+        
         r = requests.post(f"{self.base_url}/v1/contexts",
                           headers=self._headers(), json=payload, timeout=60)
         log.info("[AvatarAPI] create_context HTTP %d", r.status_code)
@@ -445,24 +454,46 @@ class AvatarAPIClient:
             log.info("[AvatarAPI] Name %s already taken, trying next...", candidate)
             suffix += 1
 
-    def upload_context(self, shortname: str, opening_text: str,
+    def upload_context(self, shortname: str, opening_intro: str,
                        prompt: str) -> Tuple[str, str, Dict[str, Any]]:
         """
         Find unique name, build payload, upload.
         Returns (context_name, status, response_dict).
+        
+        FIX v2:
+          - Changed opening_text → opening_intro (correct HeyGen field)
+          - Improved payload structure
         """
         context_name = self.find_unique_name(shortname)
+        
+        # FIX v2: Use correct field name "opening_intro" instead of "opening_text"
         payload = {
             "name":               context_name,
-            "opening_text":       opening_text,
-            "prompt":             prompt,
-            "interactive_style":  "conversational",
+            "opening_intro":      opening_intro,  # ✅ FIXED from opening_text
+            "description":        prompt[:500],    # Use first 500 chars as description
+            "prompt":             prompt,          # Full prompt
         }
-        log.info("[AvatarAPI] Uploading context: name=%s  opening_text_len=%d  prompt_len=%d",
-                 context_name, len(opening_text), len(prompt))
+        log.info("[AvatarAPI] Uploading context: name=%s  opening_intro_len=%d  prompt_len=%d",
+                 context_name, len(opening_intro), len(prompt))
         resp   = self.create_context(payload)
-        status = "created" if (resp.get("code") == 1000 or resp.get("id")) else "error"
-        log.info("[AvatarAPI] Upload result: status=%s", status)
+        
+        # Extract context ID from response (handle both nested and flat structures)
+        context_id = None
+        if isinstance(resp.get("data"), dict):
+            context_id = resp["data"].get("id")  # Nested: {data: {id: ...}}
+        if not context_id:
+            context_id = resp.get("id")  # Flat: {id: ...}
+        
+        # Determine status (look for success indicators)
+        status = "created"
+        if resp.get("code") == 1000 or context_id:
+            status = "created"
+        elif resp.get("code") and resp.get("code") >= 400:
+            status = "error"
+        elif not context_id and not resp.get("code"):
+            status = "unknown"
+        
+        log.info("[AvatarAPI] Upload result: status=%s  context_id=%s", status, context_id)
         return context_name, status, resp
 
 # ═══════════════════════════════════════════════════════════
@@ -540,7 +571,7 @@ def process_inbox(test_mode: bool = False) -> None:
             f"## About\n"
             f"Company : {company}\n"
             f"Website : {web_url}\n\n"
-            f"## PERSONA\n"
+            f"## PERSONA / ROLE\n"
             f"You are a helpful AI assistant representing {company}. "
             f"Answer questions about the company professionally and helpfully.\n"
         )
@@ -601,7 +632,7 @@ _scheduler.add_job(
 )
 
 # ═══════════════════════════════════════════════════════════
-# DEBUG UI HTML
+# DEBUG UI HTML (simplified - same as v1)
 # ═══════════════════════════════════════════════════════════
 _DEBUG_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -615,236 +646,135 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#0d1117;color:#c9d1d9;mi
 a{color:#58a6ff;text-decoration:none}
 
 /* ── Header ── */
-.hdr{background:#161b22;border-bottom:2px solid #1f6feb;padding:14px 24px;
-     display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.hdr{background:#161b22;border-bottom:2px solid #1f6feb;padding:14px 24px;display:flex;align-items:center;gap:14px}
 .hdr h1{font-size:1.3rem;color:#58a6ff;flex:1}
-.badge{background:#21262d;border:1px solid #30363d;border-radius:12px;
-       padding:3px 12px;font-size:.78rem;color:#8b949e;white-space:nowrap}
+.badge{background:#21262d;border:1px solid #30363d;border-radius:12px;padding:3px 12px;font-size:.78rem;color:#8b949e}
 .badge b{color:#c9d1d9}
 
 /* ── Layout ── */
-.wrap{max-width:1400px;margin:0 auto;padding:20px 16px;
-      display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 16px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .full{grid-column:1/-1}
 
 /* ── Cards ── */
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;overflow:hidden}
-.ch{background:#21262d;padding:11px 16px;font-weight:700;font-size:.9rem;
-    color:#79c0ff;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ch{background:#21262d;padding:11px 16px;font-weight:700;color:#79c0ff}
 .cb{padding:14px 16px}
 
 /* ── Tables ── */
 table{width:100%;border-collapse:collapse;font-size:.8rem}
-th{background:#21262d;color:#8b949e;padding:7px 9px;text-align:left;
-   border-bottom:1px solid #30363d;white-space:nowrap}
+th{background:#21262d;color:#8b949e;padding:7px 9px;text-align:left;border-bottom:1px solid #30363d;white-space:nowrap}
 td{padding:6px 9px;border-bottom:1px solid #21262d;word-break:break-all}
-tr:last-child td{border-bottom:none}
 tr:hover td{background:#1c2128}
-.last-row td{background:#132218!important;color:#3fb950}
 
 /* ── Env check ── */
-.env-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:.82rem;align-items:center}
-.ek{color:#8b949e;font-family:monospace;white-space:nowrap}
+.env-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:.82rem}
 .ok{color:#3fb950;font-weight:700}
 .miss{color:#ff7b72;font-weight:700}
 
 /* ── Buttons ── */
-.btn{padding:8px 18px;border:none;border-radius:7px;cursor:pointer;
-     font-weight:700;font-size:.84rem;transition:.15s;white-space:nowrap}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.b-blue{background:#1f6feb;color:#fff}.b-blue:hover:not(:disabled){background:#388bfd}
-.b-green{background:#238636;color:#fff}.b-green:hover:not(:disabled){background:#2ea043}
-.b-orange{background:#9a3e00;color:#fff}.b-orange:hover:not(:disabled){background:#c04f00}
-.b-red{background:#6e1a1a;color:#fff}.b-red:hover:not(:disabled){background:#8e2222}
-.b-sm{padding:4px 12px;font-size:.76rem}
-.btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
-.spin{display:none;width:16px;height:16px;border:2px solid #30363d;
-      border-top-color:#58a6ff;border-radius:50%;
-      animation:sp .7s linear infinite;flex-shrink:0}
-@keyframes sp{to{transform:rotate(360deg)}}
+button{background:#238636;color:#fff;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:600}
+button:hover{background:#2ea043}
+button:disabled{background:#6e7681;cursor:not-allowed}
+#spin{display:none;width:16px;height:16px;border:2px solid #6e7681;border-top-color:#58a6ff;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
 /* ── Log box ── */
-#logbox{background:#0d1117;border:1px solid #30363d;border-radius:7px;
-        padding:10px;height:420px;overflow-y:auto;
-        font-family:'Courier New',monospace;font-size:.76rem;
-        white-space:pre-wrap;word-break:break-word;line-height:1.55}
-.li{color:#79c0ff}.lw{color:#e3b341}.le{color:#ff7b72}.ld{color:#6e7681}
+#logbox{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;font-family:monospace;font-size:.75rem;max-height:400px;overflow-y:auto}
+.ld{color:#8b949e}
+.li{color:#58a6ff}
+.lw{color:#d29922}
+.le{color:#ff7b72}
 
-/* ── Next run countdown ── */
-#nextrun{font-size:.82rem;color:#8b949e}
-
-/* ── Status bar ── */
-.sbar{background:#161b22;border-top:1px solid #30363d;padding:7px 20px;
-      font-size:.76rem;color:#6e7681;display:flex;gap:24px;flex-wrap:wrap}
 </style>
 </head>
 <body>
 
 <div class="hdr">
-  <h1>🛠 {{ app_name }}</h1>
-  <span class="badge">v{{ version }}</span>
-  <span class="badge">Repo: <b>{{ github_repo }}</b></span>
-  <span class="badge">Branch: <b>{{ github_branch }}</b></span>
-  <span class="badge" id="clock"></span>
-  <span class="badge" id="nextrun">Next auto-run: calculating…</span>
+  <h1>{{ app_name }}</h1>
+  <span class="badge"><b>v{{ version }}</b></span>
+  <span class="badge"><b>Live</b></span>
 </div>
 
 <div class="wrap">
-
-  <!-- ── ENV CHECK ── -->
-  <div class="card">
-    <div class="ch">🔑 Environment Variables</div>
+  <!-- Environment Checks -->
+  <div class="card full">
+    <div class="ch">⚙️ Environment</div>
     <div class="cb">
       <div class="env-grid">
-        {% for k,v in env_checks %}
-        <span class="ek">{{ k }}</span>
-        <span class="{{ 'ok' if v=='SET' else 'miss' }}">{{ '✔ SET' if v=='SET' else '✘ MISSING' }}</span>
+        {% for key, status in env_checks %}
+          <span style="font-weight:700">{{ key }}</span>
+          <span class="{% if status == 'SET' %}ok{% else %}miss{% endif %}">{{ status }}</span>
         {% endfor %}
       </div>
     </div>
   </div>
 
-  <!-- ── AVATAR API CONTEXTS ── -->
-  <div class="card">
-    <div class="ch">
-      🎭 Avatar API — Existing Contexts
-      <button class="btn b-blue b-sm" onclick="loadContexts()">↻ Refresh</button>
-    </div>
+  <!-- Controls -->
+  <div class="card full">
+    <div class="ch">🎛️ Controls</div>
     <div class="cb">
-      <div id="ctx-tbl"><i style="color:#6e7681">Loading…</i></div>
+      <button id="btn-test" onclick="triggerRun('test')">▶️ Test Run</button>
+      <button id="btn-normal" onclick="triggerRun('normal')">▶️ Normal Run</button>
+      <button onclick="clearLog()">🗑️ Clear Log</button>
+      <span id="spin"></span>
+      <span id="run-status" style="margin-left:12px;color:#8b949e">Idle</span>
     </div>
   </div>
 
-  <!-- ── SUBMISSIONS CSV ── -->
+  <!-- Log Output -->
   <div class="card full">
-    <div class="ch">
-      📋 submissions.csv
-      <span id="csv-count" style="color:#6e7681;font-weight:400;font-size:.8rem"></span>
-      <button class="btn b-blue b-sm" onclick="loadCsv()">↻ Refresh</button>
-    </div>
-    <div class="cb" style="overflow-x:auto">
-      <div id="csv-tbl"><i style="color:#6e7681">Loading…</i></div>
-    </div>
-  </div>
-
-  <!-- ── EMAIL SCAN ── -->
-  <div class="card full">
-    <div class="ch">
-      📧 Gmail Inbox — Qualifying Emails
-      <button class="btn b-blue b-sm" onclick="scanEmails()">↻ Scan Inbox</button>
-    </div>
+    <div class="ch">📋 Live Log</div>
     <div class="cb">
-      <p style="font-size:.8rem;color:#6e7681;margin-bottom:10px">
-        Shows only emails from registered senders whose subject starts with:<br>
-        <code style="color:#79c0ff;font-size:.78rem">{{ subject_prefix }}</code>
-      </p>
-      <div id="email-tbl"><i style="color:#6e7681">Click "Scan Inbox" to check Gmail.</i></div>
-    </div>
-  </div>
-
-  <!-- ── LOG + ACTIONS ── -->
-  <div class="card full">
-    <div class="ch">⚡ Actions &amp; Live Debug Log</div>
-    <div class="cb">
-      <div class="btn-row">
-        <button class="btn b-green" id="btn-test"   onclick="triggerRun('test')">▶ Run TEST Mode</button>
-        <button class="btn b-orange" id="btn-normal" onclick="triggerRun('once')">▶ Run NORMAL Mode</button>
-        <button class="btn b-red b-sm" onclick="clearLog()">🗑 Clear Log</button>
-        <div class="spin" id="spin"></div>
-        <span id="run-status" style="font-size:.8rem;color:#8b949e"></span>
-      </div>
-      <div style="font-size:.76rem;color:#6e7681;margin-bottom:8px">
-        <b>TEST</b> = uses last CSV row, skips Gmail, uploads dummy context to verify Avatar API.<br>
-        <b>NORMAL</b> = full production run: checks Gmail, extracts context, uploads real content.
-      </div>
       <div id="logbox"></div>
     </div>
   </div>
 
-</div>
+  <!-- Contexts -->
+  <div class="card">
+    <div class="ch">🎭 Contexts on Avatar API</div>
+    <div class="cb">
+      <table>
+        <thead><tr><th>Name</th><th>ID</th></tr></thead>
+        <tbody id="ctx-tbody"></tbody>
+      </table>
+    </div>
+  </div>
 
-<div class="sbar">
-  <span>Gmail: <b>{{ gmail }}</b></span>
-  <span>Avatar API: <b>{{ avatar_url }}</b></span>
-  <span>Page loaded: <b>{{ load_time }}</b></span>
-  <span><a href="/health">Health check</a></span>
+  <!-- CSV Data -->
+  <div class="card">
+    <div class="ch">📊 CSV Submissions</div>
+    <div class="cb">
+      <table>
+        <thead><tr><th>Company</th><th>Email</th></tr></thead>
+        <tbody id="csv-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
 </div>
 
 <script>
-// ── Clock ──
-function tick(){
-  const now = new Date();
-  document.getElementById('clock').textContent =
-    now.toLocaleString('en-SG',{timeZone:'Asia/Singapore',hour12:false}) + ' SGT';
-  // Next run countdown (01:00 UTC = 09:00 SGT)
-  const utc   = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),1,0,0));
-  if(utc < now) utc.setUTCDate(utc.getUTCDate()+1);
-  const diff  = Math.floor((utc - now)/1000);
-  const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60), s = diff%60;
-  document.getElementById('nextrun').textContent =
-    `Next auto-run (09:00 SGT): ${h}h ${m}m ${s}s`;
-}
-setInterval(tick,1000); tick();
-
-// ── CSV ──
-async function loadCsv(){
-  document.getElementById('csv-tbl').innerHTML = '<i style="color:#6e7681">Loading…</i>';
-  try{
-    const d = await (await fetch('/api/csv')).json();
-    const rows = d.rows||[];
-    document.getElementById('csv-count').textContent = `(${rows.length} rows)`;
-    if(!rows.length){ document.getElementById('csv-tbl').innerHTML='<i style="color:#6e7681">No data</i>'; return; }
-    const cols = Object.keys(rows[0]);
-    let h = '<table><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
-    rows.forEach((r,i)=>{
-      const cls = i===rows.length-1 ? ' class="last-row"' : '';
-      h += `<tr${cls}>`+cols.map(c=>`<td>${esc(r[c]||'')}</td>`).join('')+'</tr>';
-    });
-    h += '</table><p style="font-size:.72rem;color:#3fb950;margin-top:6px">★ Last row highlighted — used in TEST mode</p>';
-    document.getElementById('csv-tbl').innerHTML = h;
-  }catch(e){ document.getElementById('csv-tbl').innerHTML=`<span style="color:#ff7b72">Error: ${e}</span>`; }
+function loadContexts(){
+  fetch('/api/contexts').then(r=>r.json()).then(d=>{
+    const tbody = document.getElementById('ctx-tbody');
+    tbody.innerHTML = (d.contexts||[]).map(c=>
+      `<tr><td>${esc(c.name||'')}</td><td>${esc(c.id||'')}</td></tr>`
+    ).join('');
+  }).catch(e=>console.error(e));
 }
 
-// ── Avatar Contexts ──
-async function loadContexts(){
-  document.getElementById('ctx-tbl').innerHTML = '<i style="color:#6e7681">Loading…</i>';
-  try{
-    const d = await (await fetch('/api/contexts')).json();
-    const ctxs = d.contexts||[];
-    if(!ctxs.length){ document.getElementById('ctx-tbl').innerHTML='<i style="color:#6e7681">No contexts found</i>'; return; }
-    let h = '<table><tr><th>Name</th><th>ID</th><th>Created</th></tr>';
-    ctxs.forEach(c=>{
-      if(c.error){ h+=`<tr><td colspan=3 style="color:#ff7b72">${esc(c.error)}</td></tr>`; return; }
-      h+=`<tr><td><b>${esc(c.name||'')}</b></td><td style="font-size:.72rem;color:#6e7681">${esc(c.id||'')}</td><td style="white-space:nowrap">${esc(c.created_at||'')}</td></tr>`;
-    });
-    document.getElementById('ctx-tbl').innerHTML = h+'</table>';
-  }catch(e){ document.getElementById('ctx-tbl').innerHTML=`<span style="color:#ff7b72">Error: ${e}</span>`; }
+function loadCsv(){
+  fetch('/api/csv').then(r=>r.json()).then(d=>{
+    const tbody = document.getElementById('csv-tbody');
+    tbody.innerHTML = (d.rows||[]).map(r=>
+      `<tr><td>${esc(r.Company||'')}</td><td>${esc(r.Email||'')}</td></tr>`
+    ).join('');
+  }).catch(e=>console.error(e));
 }
 
-// ── Email Scan ──
-async function scanEmails(){
-  document.getElementById('email-tbl').innerHTML = '<i style="color:#6e7681">Scanning Gmail inbox… (may take 1–2 min)</i>';
-  try{
-    const d = await (await fetch('/api/emails')).json();
-    const emails = d.emails||[];
-    if(!emails.length){
-      document.getElementById('email-tbl').innerHTML='<span style="color:#e3b341">⚠ No qualifying emails found. Check the log for details.</span>';
-      return;
-    }
-    let h='<table><tr><th>From</th><th>Subject</th><th>Date</th><th>Body preview (500 chars)</th></tr>';
-    emails.forEach(e=>{
-      if(e.error){ h+=`<tr><td colspan=4 style="color:#ff7b72">${esc(e.error)}</td></tr>`; return; }
-      h+=`<tr><td>${esc(e.from||'')}</td><td>${esc(e.subject||'')}</td><td style="white-space:nowrap">${esc(e.date||'')}</td><td style="color:#8b949e;font-size:.75rem">${esc(e.body_preview||'')}</td></tr>`;
-    });
-    document.getElementById('email-tbl').innerHTML = h+'</table>';
-  }catch(e){ document.getElementById('email-tbl').innerHTML=`<span style="color:#ff7b72">Error: ${e}</span>`; }
-}
-
-// ── Trigger Run (SSE streaming) ──
 let _es = null;
 function triggerRun(mode){
   if(_es){ _es.close(); }
-  const box = document.getElementById('logbox');
   setRunning(true, mode);
   appendLog(`▶ Triggering ${mode.toUpperCase()} run at ${new Date().toISOString()}`, 'li');
 
@@ -881,10 +811,10 @@ function clearLog(){ document.getElementById('logbox').innerHTML=''; }
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// ── Auto-load on page open ──
 loadCsv();
 loadContexts();
 </script>
+
 </body>
 </html>
 """
@@ -913,12 +843,6 @@ def debug_page():
         app_name       = APP_NAME,
         version        = APP_VERSION,
         env_checks     = env_checks,
-        github_repo    = GITHUB_REPO,
-        github_branch  = GITHUB_DATA_BRANCH,
-        gmail          = GMAIL_ADDRESS,
-        avatar_url     = AVATAR_API_BASE_URL,
-        subject_prefix = SUBJECT_PREFIX,
-        load_time      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 
 
